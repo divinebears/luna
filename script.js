@@ -715,61 +715,337 @@ function findSignTransitions(date) {
     return transitions;
 }
 
-// VOC cache to avoid recalculating
+// VOC cache and worker pipeline (non-blocking main thread)
+const VOC_DAY_MS = 24 * 60 * 60 * 1000;
+const VOC_PRECALC_RADIUS = 45;
 const vocCache = {};
+const vocPendingCallbacks = new Map();
+let vocPrecalcWindow = { min: null, max: null, tz: null };
+let vocRenderToken = 0;
+let vocWorker = null;
 
-function getMoonVOCForDay(date) {
-    const dayStart = new Date(date);
-    dayStart.setHours(0, 0, 0, 0);
-    const dayEnd = new Date(date);
-    dayEnd.setHours(23, 59, 59, 999);
-    const cacheKey = dayStart.toISOString() + '_' + locationTimezone;
-    if (vocCache[cacheKey]) return vocCache[cacheKey];
-
-    const pad = 5 * 864e5;
-    const scanStart = new Date(dayStart.getTime() - pad);
-    const scanEnd = new Date(dayEnd.getTime() + pad);
-    const ingresses = aeFindIngresses(scanStart, scanEnd);
-
-    const periods = [];
-    for (let i = 1; i < ingresses.length; i++) {
-        const prevIng = ingresses[i - 1];
-        const currIng = ingresses[i];
-        const result = aeFindLastAspect(prevIng.time, currIng.time);
-        const vocStart = result ? result.time : prevIng.time;
-        const vocEnd = currIng.time;
-        if (vocEnd > dayStart && vocStart < dayEnd) {
-            const clippedStart = vocStart < dayStart ? dayStart : vocStart;
-            const clippedEnd = vocEnd > dayEnd ? dayEnd : vocEnd;
-            periods.push({ start: clippedStart, end: clippedEnd, lastAspectPlanet: result ? result.planet : 'Unknown' });
-        }
-    }
-    vocCache[cacheKey] = periods;
-    return periods;
+function getVOCDayStartMs(date) {
+    const d = new Date(date);
+    d.setHours(0, 0, 0, 0);
+    return d.getTime();
 }
 
-// Async VOC loader - updates VOC card after rest of UI is already rendered
+function getVOCCacheKeyFromDayStart(dayStartMs) {
+    return `${new Date(dayStartMs).toISOString()}_${locationTimezone}`;
+}
+
+function ensureVOCWorker() {
+    if (vocWorker) return vocWorker;
+
+    const workerSource = `
+        importScripts('https://cdn.jsdelivr.net/npm/astronomy-engine@2.1.19/astronomy.browser.min.js');
+
+        const DAY_MS = 24 * 60 * 60 * 1000;
+        const VOC_PLANETS = [
+            Astronomy.Body.Sun, Astronomy.Body.Mercury, Astronomy.Body.Venus,
+            Astronomy.Body.Mars, Astronomy.Body.Jupiter, Astronomy.Body.Saturn,
+            Astronomy.Body.Uranus, Astronomy.Body.Neptune, Astronomy.Body.Pluto
+        ];
+        const BODY_NAMES = ['Sun','Mercury','Venus','Mars','Jupiter','Saturn','Uranus','Neptune','Pluto'];
+        const VOC_MAJOR_ASPECTS = [0, 60, 90, 120, 180, 240, 270, 300];
+        const dayCache = new Map();
+
+        function moonLon(d) { return Astronomy.EclipticGeoMoon(d).lon; }
+        function planetLon(body, d) {
+            const v = Astronomy.GeoVector(body, d, true);
+            return Astronomy.Ecliptic(v).elon;
+        }
+        function signIdx(lon) { return Math.floor(((lon % 360) + 360) % 360 / 30); }
+        function signedDelta(a, b) { return ((a - b) % 360 + 360) % 360; }
+        function unwrapNear(raw, near) { return raw + 360 * Math.round((near - raw) / 360); }
+
+        function findIngresses(start, end) {
+            const results = [];
+            const STEP = 30 * 60000;
+            let prevSign = signIdx(moonLon(start));
+            let t = start.getTime() + STEP;
+
+            while (t <= end.getTime()) {
+                const d = new Date(t);
+                const s = signIdx(moonLon(d));
+                if (s !== prevSign) {
+                    let lo = t - STEP;
+                    let hi = t;
+                    for (let i = 0; i < 20; i++) {
+                        const mid = (lo + hi) / 2;
+                        if (signIdx(moonLon(new Date(mid))) === prevSign) lo = mid;
+                        else hi = mid;
+                    }
+                    results.push({ time: new Date(hi), signIndex: s });
+                }
+                prevSign = s;
+                t += STEP;
+            }
+            return results;
+        }
+
+        function findLastAspect(signEntry, ingressTime) {
+            const STEP = 120000;
+            const entryMs = signEntry.getTime();
+            const endMs = ingressTime.getTime();
+            let lastAspectMs = null;
+            let lastAspectBody = null;
+
+            for (let bi = 0; bi < VOC_PLANETS.length; bi++) {
+                const body = VOC_PLANETS[bi];
+                const pts = [];
+                let t = entryMs;
+                let prevRel = null;
+
+                while (t <= endMs) {
+                    const d = new Date(t);
+                    const rawRel = signedDelta(moonLon(d), planetLon(body, d));
+                    const rel = (prevRel === null) ? rawRel : unwrapNear(rawRel, prevRel);
+                    pts.push({ t, rel });
+                    prevRel = rel;
+                    t += STEP;
+                }
+
+                if (pts[pts.length - 1].t < endMs) {
+                    const d = new Date(endMs);
+                    const rawRel = signedDelta(moonLon(d), planetLon(body, d));
+                    const rel = unwrapNear(rawRel, prevRel === null ? rawRel : prevRel);
+                    pts.push({ t: endMs, rel });
+                }
+
+                for (let i = 0; i < pts.length - 1; i++) {
+                    const p0 = pts[i];
+                    const p1 = pts[i + 1];
+                    const segMin = Math.min(p0.rel, p1.rel);
+                    const segMax = Math.max(p0.rel, p1.rel);
+                    if (segMax - segMin < 1e-9) continue;
+
+                    for (const target of VOC_MAJOR_ASPECTS) {
+                        const kStart = Math.ceil((segMin - target) / 360);
+                        const kEnd = Math.floor((segMax - target) / 360);
+
+                        for (let k = kStart; k <= kEnd; k++) {
+                            const level = target + 360 * k;
+                            let v0 = p0.rel - level;
+                            let v1 = p1.rel - level;
+
+                            if (Math.abs(v0) < 1e-9) {
+                                if (lastAspectMs === null || p0.t > lastAspectMs) {
+                                    lastAspectMs = p0.t;
+                                    lastAspectBody = BODY_NAMES[bi];
+                                }
+                                continue;
+                            }
+                            if (Math.abs(v1) < 1e-9) {
+                                if (lastAspectMs === null || p1.t > lastAspectMs) {
+                                    lastAspectMs = p1.t;
+                                    lastAspectBody = BODY_NAMES[bi];
+                                }
+                                continue;
+                            }
+                            if (v0 * v1 > 0) continue;
+
+                            let loT = p0.t;
+                            let hiT = p1.t;
+                            let loRel = p0.rel;
+                            let hiRel = p1.rel;
+                            let loV = v0;
+
+                            for (let j = 0; j < 24; j++) {
+                                const midT = (loT + hiT) / 2;
+                                const midDate = new Date(midT);
+                                const rawMid = signedDelta(moonLon(midDate), planetLon(body, midDate));
+                                const midRel = unwrapNear(rawMid, (loRel + hiRel) / 2);
+                                const midV = midRel - level;
+
+                                if (loV * midV <= 0) {
+                                    hiT = midT;
+                                    hiRel = midRel;
+                                } else {
+                                    loT = midT;
+                                    loRel = midRel;
+                                    loV = midV;
+                                }
+                            }
+
+                            const exactMs = (loT + hiT) / 2;
+                            if (lastAspectMs === null || exactMs > lastAspectMs) {
+                                lastAspectMs = exactMs;
+                                lastAspectBody = BODY_NAMES[bi];
+                            }
+                        }
+                    }
+                }
+            }
+
+            return lastAspectMs ? { time: new Date(lastAspectMs), planet: lastAspectBody } : null;
+        }
+
+        function computeDayPeriods(dayStartMs) {
+            if (dayCache.has(dayStartMs)) return dayCache.get(dayStartMs);
+
+            const dayStart = new Date(dayStartMs);
+            const dayEnd = new Date(dayStartMs + DAY_MS - 1);
+            const pad = 5 * 864e5;
+            const scanStart = new Date(dayStartMs - pad);
+            const scanEnd = new Date(dayEnd.getTime() + pad);
+            const ingresses = findIngresses(scanStart, scanEnd);
+
+            const periods = [];
+            for (let i = 1; i < ingresses.length; i++) {
+                const prevIng = ingresses[i - 1];
+                const currIng = ingresses[i];
+                const result = findLastAspect(prevIng.time, currIng.time);
+                const vocStart = result ? result.time : prevIng.time;
+                const vocEnd = currIng.time;
+
+                if (vocEnd > dayStart && vocStart < dayEnd) {
+                    const clippedStart = vocStart < dayStart ? dayStart : vocStart;
+                    const clippedEnd = vocEnd > dayEnd ? dayEnd : vocEnd;
+                    periods.push({
+                        startMs: clippedStart.getTime(),
+                        endMs: clippedEnd.getTime(),
+                        lastAspectPlanet: result ? result.planet : 'Unknown'
+                    });
+                }
+            }
+
+            dayCache.set(dayStartMs, periods);
+            return periods;
+        }
+
+        self.onmessage = (event) => {
+            const data = event.data || {};
+            if (data.type !== 'computeDay') return;
+
+            const periods = computeDayPeriods(data.dayStartMs);
+            self.postMessage({
+                type: 'vocDayResult',
+                cacheKey: data.cacheKey,
+                dayStartMs: data.dayStartMs,
+                periods
+            });
+        };
+    `;
+
+    const workerUrl = URL.createObjectURL(new Blob([workerSource], { type: 'application/javascript' }));
+    vocWorker = new Worker(workerUrl);
+    URL.revokeObjectURL(workerUrl);
+
+    vocWorker.onmessage = (event) => {
+        const data = event.data || {};
+        if (data.type !== 'vocDayResult' || !data.cacheKey) return;
+
+        vocCache[data.cacheKey] = data.periods || [];
+        const callbacks = vocPendingCallbacks.get(data.cacheKey) || [];
+        vocPendingCallbacks.delete(data.cacheKey);
+        callbacks.forEach((cb) => cb(vocCache[data.cacheKey]));
+
+        if (dayDialogDate && getVOCDayStartMs(dayDialogDate) === data.dayStartMs) {
+            const dayDialog = document.getElementById('day-dialog');
+            if (dayDialog && dayDialog.style.display === 'flex') {
+                updateDayDialogContent();
+            }
+        }
+    };
+
+    return vocWorker;
+}
+
+function requestVOCForDate(date, onReady) {
+    const dayStartMs = getVOCDayStartMs(date);
+    const cacheKey = getVOCCacheKeyFromDayStart(dayStartMs);
+
+    if (vocCache[cacheKey]) {
+        if (onReady) onReady(vocCache[cacheKey]);
+        return true;
+    }
+
+    if (vocPendingCallbacks.has(cacheKey)) {
+        if (onReady) vocPendingCallbacks.get(cacheKey).push(onReady);
+        return false;
+    }
+
+    vocPendingCallbacks.set(cacheKey, onReady ? [onReady] : []);
+    ensureVOCWorker().postMessage({ type: 'computeDay', dayStartMs, cacheKey });
+    return false;
+}
+
+// Pre-calculate around center date in center-out order (worker thread)
+function precalcVOCRange(centerDate, radius = VOC_PRECALC_RADIUS) {
+    if (vocPrecalcWindow.tz !== locationTimezone) {
+        vocPrecalcWindow = { min: null, max: null, tz: locationTimezone };
+    }
+
+    const centerDayStartMs = getVOCDayStartMs(centerDate);
+    const minTarget = centerDayStartMs - radius * VOC_DAY_MS;
+    const maxTarget = centerDayStartMs + radius * VOC_DAY_MS;
+
+    if (vocPrecalcWindow.min !== null && minTarget >= vocPrecalcWindow.min && maxTarget <= vocPrecalcWindow.max) {
+        return;
+    }
+
+    for (let offset = 0; offset <= radius; offset++) {
+        const forward = centerDayStartMs + offset * VOC_DAY_MS;
+        requestVOCForDate(new Date(forward));
+
+        if (offset > 0) {
+            const backward = centerDayStartMs - offset * VOC_DAY_MS;
+            requestVOCForDate(new Date(backward));
+        }
+    }
+
+    if (vocPrecalcWindow.min === null || minTarget < vocPrecalcWindow.min) vocPrecalcWindow.min = minTarget;
+    if (vocPrecalcWindow.max === null || maxTarget > vocPrecalcWindow.max) vocPrecalcWindow.max = maxTarget;
+    vocPrecalcWindow.tz = locationTimezone;
+}
+
+function getMoonVOCForDay(date) {
+    const dayStartMs = getVOCDayStartMs(date);
+    const cacheKey = getVOCCacheKeyFromDayStart(dayStartMs);
+
+    if (!vocCache[cacheKey]) {
+        requestVOCForDate(date, () => {
+            const dayDialog = document.getElementById('day-dialog');
+            if (dayDialog && dayDialog.style.display === 'flex' && dayDialogDate) {
+                if (getVOCDayStartMs(dayDialogDate) === dayStartMs) {
+                    updateDayDialogContent();
+                }
+            }
+        });
+        return [];
+    }
+
+    return vocCache[cacheKey].map((p) => ({
+        start: new Date(p.startMs),
+        end: new Date(p.endMs),
+        lastAspectPlanet: p.lastAspectPlanet
+    }));
+}
+
+// VOC loader - non-blocking and cache-first
 function updateVOCAsync(date) {
     const vocCard = document.getElementById('voc-card');
     const vocStatus = document.getElementById('voc-status');
     const vocTiming = document.getElementById('voc-timing');
     const vocTimes = document.getElementById('voc-times');
-    
-    const cacheKey = new Date(date.getFullYear(), date.getMonth(), date.getDate()).toISOString() + '_' + locationTimezone;
+
+    const renderToken = ++vocRenderToken;
+    const dayStartMs = getVOCDayStartMs(date);
+    const cacheKey = getVOCCacheKeyFromDayStart(dayStartMs);
+
+    const safeRender = (periods) => {
+        if (renderToken !== vocRenderToken) return;
+        renderVOC(periods, vocCard, vocStatus, vocTiming, vocTimes);
+    };
+
     if (vocCache[cacheKey]) {
-        renderVOC(vocCache[cacheKey], vocCard, vocStatus, vocTiming, vocTimes);
-        return;
+        safeRender(vocCache[cacheKey]);
+    } else {
+        requestVOCForDate(date, safeRender);
     }
 
-    // Show loading state
-    vocStatus.textContent = '⏳ Calculating...';
-    vocStatus.className = 'voc-status';
-    vocTiming.style.display = 'none';
-
-    setTimeout(() => {
-        const vocPeriods = getMoonVOCForDay(date);
-        renderVOC(vocPeriods, vocCard, vocStatus, vocTiming, vocTimes);
-    }, 10);
+    precalcVOCRange(date, VOC_PRECALC_RADIUS);
 }
 
 function renderVOC(vocPeriods, vocCard, vocStatus, vocTiming, vocTimes) {
@@ -778,12 +1054,16 @@ function renderVOC(vocPeriods, vocCard, vocStatus, vocTiming, vocTimes) {
         vocStatus.textContent = '⚠ VOC Active';
         vocStatus.className = 'voc-status active';
         vocTiming.style.display = 'block';
-        vocTimes.innerHTML = vocPeriods.map(p => `
-            <div class="voc-period-item">
-                ${formatTimeInTZ(p.start)} - ${formatTimeInTZ(p.end)}
-                <br><small>Last aspect: ${p.lastAspectPlanet}</small>
-            </div>
-        `).join('');
+        vocTimes.innerHTML = vocPeriods.map((p) => {
+            const start = p.startMs ? new Date(p.startMs) : p.start;
+            const end = p.endMs ? new Date(p.endMs) : p.end;
+            return `
+                <div class="voc-period-item">
+                    ${formatTimeInTZ(start)} - ${formatTimeInTZ(end)}
+                    <br><small>Last aspect: ${p.lastAspectPlanet}</small>
+                </div>
+            `;
+        }).join('');
     } else {
         vocCard.classList.remove('voc-active');
         vocStatus.textContent = '✓ Clear';
@@ -835,20 +1115,104 @@ function getMoonRiseSet(date) {
 }
 
 async function getLocationByIP() {
+    const fallbackTimezone = Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC';
+    const toNumber = (value) => {
+        const num = Number(value);
+        return Number.isFinite(num) ? num : null;
+    };
+
+    const apis = [
+        {
+            url: 'https://ipapi.co/json/',
+            parse: (data) => {
+                const lat = toNumber(data.latitude);
+                const lon = toNumber(data.longitude);
+                if (lat === null || lon === null) return null;
+                return {
+                    lat,
+                    lon,
+                    name: `${data.city || 'Unknown'}, ${data.country_name || data.country || ''}`.replace(/,\s*$/, ''),
+                    timezone: data.timezone || fallbackTimezone
+                };
+            }
+        },
+        {
+            url: 'https://ipwho.is/',
+            parse: (data) => {
+                if (data.success === false) return null;
+                const lat = toNumber(data.latitude);
+                const lon = toNumber(data.longitude);
+                if (lat === null || lon === null) return null;
+                return {
+                    lat,
+                    lon,
+                    name: `${data.city || 'Unknown'}, ${data.country || ''}`.replace(/,\s*$/, ''),
+                    timezone: data.timezone?.id || fallbackTimezone
+                };
+            }
+        },
+        {
+            url: 'https://freeipapi.com/api/json',
+            parse: (data) => {
+                const lat = toNumber(data.latitude);
+                const lon = toNumber(data.longitude);
+                if (lat === null || lon === null) return null;
+                return {
+                    lat,
+                    lon,
+                    name: `${data.cityName || 'Unknown'}, ${data.countryName || ''}`.replace(/,\s*$/, ''),
+                    timezone: data.timeZone || fallbackTimezone
+                };
+            }
+        }
+    ];
+
+    for (const api of apis) {
+        try {
+            const controller = new AbortController();
+            const timeout = setTimeout(() => controller.abort(), 4000);
+            const response = await fetch(api.url, { signal: controller.signal });
+            clearTimeout(timeout);
+            if (!response.ok) continue;
+            const data = await response.json();
+            const result = api.parse(data);
+            if (result) return result;
+        } catch (e) {
+            console.log('IP API failed:', api.url, e.message);
+        }
+    }
+
+    // Browser geolocation fallback
     try {
-        const response = await fetch('https://ipapi.co/json/');
-        const data = await response.json();
-        if (data.latitude && data.longitude) {
-            return {
-                lat: data.latitude,
-                lon: data.longitude,
-                name: `${data.city}, ${data.country_name}`,
-                timezone: data.timezone
-            };
+        const pos = await new Promise((resolve, reject) => {
+            if (!navigator.geolocation) return reject(new Error('No geolocation'));
+            navigator.geolocation.getCurrentPosition(resolve, reject, { timeout: 5000 });
+        });
+
+        const lat = toNumber(pos.coords.latitude);
+        const lon = toNumber(pos.coords.longitude);
+        if (lat !== null && lon !== null) {
+            let nearest = CITIES[0];
+            let minDist = Infinity;
+            CITIES.forEach((city) => {
+                const d = Math.pow(city.lat - lat, 2) + Math.pow(city.lon - lon, 2);
+                if (d < minDist) {
+                    minDist = d;
+                    nearest = city;
+                }
+            });
+            return { lat, lon, name: nearest.name, timezone: nearest.tz };
         }
     } catch (e) {
-        console.log('Could not detect location by IP');
+        console.log('Geolocation fallback failed:', e.message);
     }
+
+    // Timezone-based fallback
+    const tzMatch = CITIES.find(c => c.tz === fallbackTimezone);
+    if (tzMatch) {
+        return { lat: tzMatch.lat, lon: tzMatch.lon, name: tzMatch.name, timezone: tzMatch.tz };
+    }
+
     return null;
 }
 
@@ -908,30 +1272,32 @@ async function initLocationSelector() {
     
     if (ipLocation) {
         detectOption.textContent = `📍 ${ipLocation.name} (Auto-detected)`;
-        detectOption.dataset.lat = ipLocation.lat;
-        detectOption.dataset.lon = ipLocation.lon;
+        detectOption.dataset.lat = String(ipLocation.lat);
+        detectOption.dataset.lon = String(ipLocation.lon);
         detectOption.dataset.name = ipLocation.name;
         detectOption.dataset.tz = ipLocation.timezone;
         
         const savedLocation = localStorage.getItem('selectedLocation');
-        if (!savedLocation || savedLocation === 'detect') {
+        const savedIndex = Number.parseInt(savedLocation ?? '', 10);
+        const hasValidSavedCity = Number.isInteger(savedIndex) && savedIndex >= 0 && savedIndex < CITIES.length;
+
+        if (savedLocation === 'detect' || !hasValidSavedCity) {
             LAT = ipLocation.lat;
             LON = ipLocation.lon;
             locationName = ipLocation.name;
             locationTimezone = ipLocation.timezone;
             locationSelect.value = 'detect';
+            localStorage.setItem('selectedLocation', 'detect');
             updateCurrentTime();
             updateDailyView();
             updateMonthlyCalendar();
         } else {
-            const savedIndex = parseInt(savedLocation);
-            if (savedIndex >= 0 && savedIndex < CITIES.length) {
-                locationSelect.value = savedIndex;
-                updateLocationFromCity(savedIndex);
-            }
+            locationSelect.value = String(savedIndex);
+            updateLocationFromCity(savedIndex);
         }
     } else {
-        detectOption.textContent = '📍 Location detection unavailable';
+        detectOption.textContent = '📍 Select your location ▼';
+        detectOption.disabled = true;
         const savedLocation = localStorage.getItem('selectedLocation');
         if (savedLocation && savedLocation !== 'detect') {
             const savedIndex = parseInt(savedLocation);
@@ -939,13 +1305,8 @@ async function initLocationSelector() {
                 locationSelect.value = savedIndex;
                 updateLocationFromCity(savedIndex);
             }
-        } else {
-            const casablancaIndex = CITIES.findIndex(c => c.name.includes('Casablanca'));
-            if (casablancaIndex >= 0) {
-                locationSelect.value = casablancaIndex;
-                updateLocationFromCity(casablancaIndex);
-            }
         }
+        // No default — user must select from dropdown
     }
     
     locationSelect.addEventListener('change', (e) => {
@@ -1079,14 +1440,6 @@ function updateDailyView() {
     
     // VOC - load asynchronously to keep UI responsive
     updateVOCAsync(date);
-    
-    // Pre-cache adjacent days' VOC in background for instant nav
-    setTimeout(() => {
-        const prev = new Date(date.getTime() - 864e5);
-        const next = new Date(date.getTime() + 864e5);
-        getMoonVOCForDay(prev);
-        getMoonVOCForDay(next);
-    }, 100);
     
     // Retrograde planets
     const retroPlanets = getRetrogradePlanets(date);
@@ -1489,6 +1842,9 @@ document.addEventListener('DOMContentLoaded', () => {
     initSwipeNavigation();
     initDayDialogSwipe();
     setInterval(updateCurrentTime, 60000);
+    
+    // Warm VOC cache around current date in worker
+    precalcVOCRange(selectedDate, VOC_PRECALC_RADIUS);
     
     // Tab switching
     document.querySelectorAll('.tab-btn').forEach(btn => {
