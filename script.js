@@ -182,7 +182,6 @@ let locationTimezone = "Africa/Casablanca";
 let selectedDate = new Date();
 let currentMonth = new Date();
 let dayDialogDate = null;
-let _updateScheduled = false;
 
 // ============================================
 // TIME FORMATTING
@@ -238,6 +237,7 @@ function formatShortDateInTZ(date) {
     }
 }
 
+// Fix 3: Format date for card labels (smaller, shorter format)
 function formatCardDateLabel(date) {
     try {
         return date.toLocaleDateString('en-US', {
@@ -571,14 +571,13 @@ function getMoonPhaseAngle(date) {
     return normalize(moonLongitude(jd) - sunLongitude(jd));
 }
 
-// Widened Full Moon threshold from 174-186 to 168-192 (±12 degrees)
 function getPhaseInfo(date) {
     const phase = getMoonPhaseAngle(date);
     if (phase < 6 || phase >= 354) return { name: "New Moon", emoji: "🌑" };
     if (phase < 84) return { name: "Waxing Crescent", emoji: "🌒" };
     if (phase < 96) return { name: "First Quarter", emoji: "🌓" };
-    if (phase < 168) return { name: "Waxing Gibbous", emoji: "🌔" };
-    if (phase < 192) return { name: "Full Moon", emoji: "🌕" };
+    if (phase < 174) return { name: "Waxing Gibbous", emoji: "🌔" };
+    if (phase < 186) return { name: "Full Moon", emoji: "🌕" };
     if (phase < 264) return { name: "Waning Gibbous", emoji: "🌖" };
     if (phase < 276) return { name: "Last Quarter", emoji: "🌗" };
     return { name: "Waning Crescent", emoji: "🌘" };
@@ -716,11 +715,16 @@ function findSignTransitions(date) {
     return transitions;
 }
 
+// VOC cache to avoid recalculating
+const vocCache = {};
+
 function getMoonVOCForDay(date) {
     const dayStart = new Date(date);
     dayStart.setHours(0, 0, 0, 0);
     const dayEnd = new Date(date);
     dayEnd.setHours(23, 59, 59, 999);
+    const cacheKey = dayStart.toISOString() + '_' + locationTimezone;
+    if (vocCache[cacheKey]) return vocCache[cacheKey];
 
     const pad = 5 * 864e5;
     const scanStart = new Date(dayStart.getTime() - pad);
@@ -731,22 +735,62 @@ function getMoonVOCForDay(date) {
     for (let i = 1; i < ingresses.length; i++) {
         const prevIng = ingresses[i - 1];
         const currIng = ingresses[i];
-
         const result = aeFindLastAspect(prevIng.time, currIng.time);
         const vocStart = result ? result.time : prevIng.time;
         const vocEnd = currIng.time;
-
         if (vocEnd > dayStart && vocStart < dayEnd) {
             const clippedStart = vocStart < dayStart ? dayStart : vocStart;
             const clippedEnd = vocEnd > dayEnd ? dayEnd : vocEnd;
-            periods.push({
-                start: clippedStart,
-                end: clippedEnd,
-                lastAspectPlanet: result ? result.planet : 'Unknown'
-            });
+            periods.push({ start: clippedStart, end: clippedEnd, lastAspectPlanet: result ? result.planet : 'Unknown' });
         }
     }
+    vocCache[cacheKey] = periods;
     return periods;
+}
+
+// Async VOC loader - updates VOC card after rest of UI is already rendered
+function updateVOCAsync(date) {
+    const vocCard = document.getElementById('voc-card');
+    const vocStatus = document.getElementById('voc-status');
+    const vocTiming = document.getElementById('voc-timing');
+    const vocTimes = document.getElementById('voc-times');
+    
+    const cacheKey = new Date(date.getFullYear(), date.getMonth(), date.getDate()).toISOString() + '_' + locationTimezone;
+    if (vocCache[cacheKey]) {
+        renderVOC(vocCache[cacheKey], vocCard, vocStatus, vocTiming, vocTimes);
+        return;
+    }
+
+    // Show loading state
+    vocStatus.textContent = '⏳ Calculating...';
+    vocStatus.className = 'voc-status';
+    vocTiming.style.display = 'none';
+
+    setTimeout(() => {
+        const vocPeriods = getMoonVOCForDay(date);
+        renderVOC(vocPeriods, vocCard, vocStatus, vocTiming, vocTimes);
+    }, 10);
+}
+
+function renderVOC(vocPeriods, vocCard, vocStatus, vocTiming, vocTimes) {
+    if (vocPeriods.length > 0) {
+        vocCard.classList.add('voc-active');
+        vocStatus.textContent = '⚠ VOC Active';
+        vocStatus.className = 'voc-status active';
+        vocTiming.style.display = 'block';
+        vocTimes.innerHTML = vocPeriods.map(p => `
+            <div class="voc-period-item">
+                ${formatTimeInTZ(p.start)} - ${formatTimeInTZ(p.end)}
+                <br><small>Last aspect: ${p.lastAspectPlanet}</small>
+            </div>
+        `).join('');
+    } else {
+        vocCard.classList.remove('voc-active');
+        vocStatus.textContent = '✓ Clear';
+        vocStatus.className = 'voc-status inactive';
+        vocTiming.style.display = 'none';
+        vocTimes.innerHTML = '';
+    }
 }
 
 
@@ -774,192 +818,76 @@ function getRetrogradePlanets(date) {
     return retro;
 }
 
-// ============================================
-// ECLIPSE CALCULATIONS
-// ============================================
-function getEclipsesForDay(date) {
-    const eclipses = [];
-    const dayStart = new Date(date);
-    dayStart.setHours(0, 0, 0, 0);
-    const dayEnd = new Date(date);
-    dayEnd.setHours(23, 59, 59, 999);
-
-    try {
-        const searchStart = new Date(dayStart.getTime() - 2 * 24 * 3600000);
-        let solarEclipse = Astronomy.SearchSolarEclipse(searchStart);
-        for (let i = 0; i < 3 && solarEclipse; i++) {
-            const peakTime = solarEclipse.peak.date;
-            if (peakTime >= dayStart && peakTime <= dayEnd) {
-                let kind = 'Solar Eclipse';
-                if (solarEclipse.kind === 'total') kind = 'Total Solar Eclipse';
-                else if (solarEclipse.kind === 'annular') kind = 'Annular Solar Eclipse';
-                else if (solarEclipse.kind === 'partial') kind = 'Partial Solar Eclipse';
-                eclipses.push({ type: 'solar', kind, peakTime, emoji: '🌑☀️' });
-            }
-            if (peakTime > dayEnd) break;
-            solarEclipse = Astronomy.NextSolarEclipse(solarEclipse.peak.date);
-        }
-    } catch (e) { console.log('Solar eclipse search error:', e); }
-
-    try {
-        const searchStart = new Date(dayStart.getTime() - 2 * 24 * 3600000);
-        let lunarEclipse = Astronomy.SearchLunarEclipse(searchStart);
-        for (let i = 0; i < 3 && lunarEclipse; i++) {
-            const peakTime = lunarEclipse.peak.date;
-            if (peakTime >= dayStart && peakTime <= dayEnd) {
-                let kind = 'Lunar Eclipse';
-                if (lunarEclipse.kind === 'total') kind = 'Total Lunar Eclipse';
-                else if (lunarEclipse.kind === 'partial') kind = 'Partial Lunar Eclipse';
-                else if (lunarEclipse.kind === 'penumbral') kind = 'Penumbral Lunar Eclipse';
-                eclipses.push({ type: 'lunar', kind, peakTime, emoji: '🌒🌕' });
-            }
-            if (peakTime > dayEnd) break;
-            lunarEclipse = Astronomy.NextLunarEclipse(lunarEclipse.peak.date);
-        }
-    } catch (e) { console.log('Lunar eclipse search error:', e); }
-
-    return eclipses;
-}
-
-function getNextEclipses(fromDate, count) {
-    const results = [];
-    try {
-        let solar = Astronomy.SearchSolarEclipse(fromDate);
-        for (let i = 0; i < count && solar; i++) {
-            let kind = solar.kind.charAt(0).toUpperCase() + solar.kind.slice(1) + ' Solar Eclipse';
-            results.push({ type: 'solar', kind, peakTime: solar.peak.date, emoji: '🌑☀️' });
-            solar = Astronomy.NextSolarEclipse(solar.peak.date);
-        }
-    } catch (e) {}
-    try {
-        let lunar = Astronomy.SearchLunarEclipse(fromDate);
-        for (let i = 0; i < count && lunar; i++) {
-            let kind = lunar.kind.charAt(0).toUpperCase() + lunar.kind.slice(1) + ' Lunar Eclipse';
-            results.push({ type: 'lunar', kind, peakTime: lunar.peak.date, emoji: '🌒🌕' });
-            lunar = Astronomy.NextLunarEclipse(lunar.peak.date);
-        }
-    } catch (e) {}
-    results.sort((a, b) => a.peakTime - b.peakTime);
-    return results.slice(0, count);
-}
-
 function getMoonRiseSet(date) {
     const jd = toJD(date);
     const phase = normalize(moonLongitude(jd) - sunLongitude(jd));
     const phaseOffset = (phase / 360) * 24 * 60;
-
+    
     const baseRise = new Date(date);
     baseRise.setHours(18, 30, 0, 0);
     const baseSet = new Date(date);
     baseSet.setHours(6, 45, 0, 0);
-
+    
     const rise = new Date(baseRise.getTime() + phaseOffset * 60 * 1000);
     const set = new Date(baseSet.getTime() + phaseOffset * 60 * 1000);
-
+    
     return { rise, set };
 }
 
-// ============================================
-// IP LOCATION DETECTION (no browser geolocation prompt)
-// ============================================
 async function getLocationByIP() {
-    const fallbackTimezone = Intl.DateTimeFormat().resolvedOptions().timeZone || 'Africa/Casablanca';
-    const toNumber = (value) => {
-        const num = Number(value);
-        return Number.isFinite(num) ? num : null;
-    };
-
-    const apis = [
-        {
-            url: 'https://ipapi.co/json/',
-            parse: (data) => {
-                const lat = toNumber(data.latitude);
-                const lon = toNumber(data.longitude);
-                if (lat === null || lon === null) return null;
-                return {
-                    lat,
-                    lon,
-                    name: `${data.city || 'Unknown'}, ${data.country_name || data.country || ''}`.replace(/,\s*$/, ''),
-                    timezone: data.timezone || fallbackTimezone
-                };
-            }
-        },
-        {
-            url: 'https://ipwho.is/',
-            parse: (data) => {
-                if (data.success === false) return null;
-                const lat = toNumber(data.latitude);
-                const lon = toNumber(data.longitude);
-                if (lat === null || lon === null) return null;
-                return {
-                    lat,
-                    lon,
-                    name: `${data.city || 'Unknown'}, ${data.country || ''}`.replace(/,\s*$/, ''),
-                    timezone: data.timezone?.id || fallbackTimezone
-                };
-            }
-        },
-        {
-            url: 'https://freeipapi.com/api/json',
-            parse: (data) => {
-                const lat = toNumber(data.latitude);
-                const lon = toNumber(data.longitude);
-                if (lat === null || lon === null) return null;
-                return {
-                    lat,
-                    lon,
-                    name: `${data.cityName || 'Unknown'}, ${data.countryName || ''}`.replace(/,\s*$/, ''),
-                    timezone: data.timeZone || fallbackTimezone
-                };
-            }
+    try {
+        const response = await fetch('https://ipapi.co/json/');
+        const data = await response.json();
+        if (data.latitude && data.longitude) {
+            return {
+                lat: data.latitude,
+                lon: data.longitude,
+                name: `${data.city}, ${data.country_name}`,
+                timezone: data.timezone
+            };
         }
-    ];
-
-    for (const api of apis) {
-        try {
-            const controller = new AbortController();
-            const timeout = setTimeout(() => controller.abort(), 4000);
-            const response = await fetch(api.url, { signal: controller.signal });
-            clearTimeout(timeout);
-            if (!response.ok) continue;
-            const data = await response.json();
-            const result = api.parse(data);
-            if (result) return result;
-        } catch (e) {
-            console.log('IP API failed:', api.url, e.message);
-        }
+    } catch (e) {
+        console.log('Could not detect location by IP');
     }
-
-    // Timezone-based fallback (no browser geolocation prompt)
-    const tzMatch = CITIES.find(c => c.tz === fallbackTimezone);
-    if (tzMatch) {
-        return { lat: tzMatch.lat, lon: tzMatch.lon, name: tzMatch.name, timezone: tzMatch.tz };
-    }
-
-    return { lat: 33.5731, lon: -7.5898, name: 'Casablanca, Morocco', timezone: 'Africa/Casablanca' };
+    return null;
 }
 
 // ============================================
-// STAR BACKGROUND (no shooting stars)
+// STAR BACKGROUND
 // ============================================
 function createStarBackground() {
     const container = document.getElementById('star-background');
     if (!container) return;
+    
     for (let i = 0; i < 100; i++) {
         const star = document.createElement('div');
         star.className = 'star';
+        const size = Math.random() * 2 + 1;
+        star.style.width = size + 'px';
+        star.style.height = size + 'px';
         star.style.left = Math.random() * 100 + '%';
         star.style.top = Math.random() * 100 + '%';
-        star.style.width = star.style.height = (Math.random() * 2 + 1) + 'px';
         star.style.setProperty('--duration', (Math.random() * 3 + 2) + 's');
-        star.style.setProperty('--delay', (Math.random() * 3) + 's');
+        star.style.setProperty('--delay', Math.random() * 5 + 's');
         container.appendChild(star);
     }
+    
+    setInterval(() => {
+        if (Math.random() > 0.7) {
+            createShootingStar(container);
+        }
+    }, 3000);
 }
 
-// ============================================
-// LOCATION SELECTOR
-// ============================================
+function createShootingStar(container) {
+    const star = document.createElement('div');
+    star.className = 'shooting-star';
+    star.style.left = Math.random() * 70 + '%';
+    star.style.top = Math.random() * 30 + '%';
+    container.appendChild(star);
+    setTimeout(() => star.remove(), 1000);
+}
+
 async function initLocationSelector() {
     const locationSelect = document.getElementById('location-select');
     if (!locationSelect) return;
@@ -977,30 +905,47 @@ async function initLocationSelector() {
     });
     
     const ipLocation = await getLocationByIP();
-
-    detectOption.textContent = `📍 ${ipLocation.name} (Auto-detected)`;
-    detectOption.dataset.lat = String(ipLocation.lat);
-    detectOption.dataset.lon = String(ipLocation.lon);
-    detectOption.dataset.name = ipLocation.name;
-    detectOption.dataset.tz = ipLocation.timezone;
-
-    const savedLocation = localStorage.getItem('selectedLocation');
-    const savedIndex = Number.parseInt(savedLocation ?? '', 10);
-    const hasValidSavedCity = Number.isInteger(savedIndex) && savedIndex >= 0 && savedIndex < CITIES.length;
-
-    if (savedLocation === 'detect' || !hasValidSavedCity) {
-        LAT = ipLocation.lat;
-        LON = ipLocation.lon;
-        locationName = ipLocation.name;
-        locationTimezone = ipLocation.timezone;
-        locationSelect.value = 'detect';
-        localStorage.setItem('selectedLocation', 'detect');
-        updateCurrentTime();
-        updateDailyView();
-        updateMonthlyCalendar();
+    
+    if (ipLocation) {
+        detectOption.textContent = `📍 ${ipLocation.name} (Auto-detected)`;
+        detectOption.dataset.lat = ipLocation.lat;
+        detectOption.dataset.lon = ipLocation.lon;
+        detectOption.dataset.name = ipLocation.name;
+        detectOption.dataset.tz = ipLocation.timezone;
+        
+        const savedLocation = localStorage.getItem('selectedLocation');
+        if (!savedLocation || savedLocation === 'detect') {
+            LAT = ipLocation.lat;
+            LON = ipLocation.lon;
+            locationName = ipLocation.name;
+            locationTimezone = ipLocation.timezone;
+            locationSelect.value = 'detect';
+            updateCurrentTime();
+            updateDailyView();
+            updateMonthlyCalendar();
+        } else {
+            const savedIndex = parseInt(savedLocation);
+            if (savedIndex >= 0 && savedIndex < CITIES.length) {
+                locationSelect.value = savedIndex;
+                updateLocationFromCity(savedIndex);
+            }
+        }
     } else {
-        locationSelect.value = String(savedIndex);
-        updateLocationFromCity(savedIndex);
+        detectOption.textContent = '📍 Location detection unavailable';
+        const savedLocation = localStorage.getItem('selectedLocation');
+        if (savedLocation && savedLocation !== 'detect') {
+            const savedIndex = parseInt(savedLocation);
+            if (savedIndex >= 0 && savedIndex < CITIES.length) {
+                locationSelect.value = savedIndex;
+                updateLocationFromCity(savedIndex);
+            }
+        } else {
+            const casablancaIndex = CITIES.findIndex(c => c.name.includes('Casablanca'));
+            if (casablancaIndex >= 0) {
+                locationSelect.value = casablancaIndex;
+                updateLocationFromCity(casablancaIndex);
+            }
+        }
     }
     
     locationSelect.addEventListener('change', (e) => {
@@ -1043,39 +988,29 @@ function updateCurrentTime() {
     document.getElementById('current-time').textContent = formatTimeInTZ(new Date());
 }
 
-// ============================================
-// FAST DAILY VIEW UPDATE
-// Uses requestAnimationFrame to show date label instantly,
-// then computes heavy astro data on the next frame.
-// ============================================
 function updateDailyView() {
     const date = selectedDate;
     const now = new Date();
     const isToday = date.toDateString() === now.toDateString();
     
-    // Instantly update lightweight UI elements
     document.getElementById('selected-date').textContent = formatDateInTZ(date);
     document.getElementById('return-today').style.display = isToday ? 'none' : 'block';
     
+    // Fix 3: Update card date labels
     const cardDateLabel = formatCardDateLabel(date);
     document.getElementById('phase-card-date').textContent = cardDateLabel;
     document.getElementById('mansion-card-date').textContent = cardDateLabel;
     document.getElementById('zodiac-card-date').textContent = cardDateLabel;
     document.getElementById('voc-card-date').textContent = cardDateLabel;
     document.getElementById('retro-card-date').textContent = cardDateLabel;
-    document.getElementById('eclipse-card-date').textContent = cardDateLabel;
-
-    // Compute heavy data synchronously but after the DOM paint
-    _computeDailyData(date);
-}
-
-function _computeDailyData(date) {
-    // Phase
+    
+    // Moon Phase
     const phaseInfo = getPhaseInfo(date);
     document.getElementById('phase-emoji').textContent = phaseInfo.emoji;
     document.getElementById('phase-name').textContent = phaseInfo.name;
     document.getElementById('illumination').textContent = getIllumination(date) + '% illuminated';
     
+    // Exact phase time
     const exactPhaseBox = document.getElementById('exact-phase-box');
     const phaseTargets = [0, 90, 180, 270];
     const phaseNames = ['New Moon', 'First Quarter', 'Full Moon', 'Last Quarter'];
@@ -1142,31 +1077,16 @@ function _computeDailyData(date) {
         allMansionsContainer.appendChild(mansionItem);
     });
     
-    // VOC
-    const vocPeriods = getMoonVOCForDay(date);
-    const vocCard = document.getElementById('voc-card');
-    const vocStatus = document.getElementById('voc-status');
-    const vocTiming = document.getElementById('voc-timing');
-    const vocTimes = document.getElementById('voc-times');
+    // VOC - load asynchronously to keep UI responsive
+    updateVOCAsync(date);
     
-    if (vocPeriods.length > 0) {
-        vocCard.classList.add('voc-active');
-        vocStatus.textContent = '⚠ VOC Active';
-        vocStatus.className = 'voc-status active';
-        vocTiming.style.display = 'block';
-        vocTimes.innerHTML = vocPeriods.map(p => `
-            <div class="voc-period-item">
-                ${formatTimeInTZ(p.start)} - ${formatTimeInTZ(p.end)}
-                <br><small>Last aspect: ${p.lastAspectPlanet}</small>
-            </div>
-        `).join('');
-    } else {
-        vocCard.classList.remove('voc-active');
-        vocStatus.textContent = '✓ Clear';
-        vocStatus.className = 'voc-status inactive';
-        vocTiming.style.display = 'none';
-        vocTimes.innerHTML = '';
-    }
+    // Pre-cache adjacent days' VOC in background for instant nav
+    setTimeout(() => {
+        const prev = new Date(date.getTime() - 864e5);
+        const next = new Date(date.getTime() + 864e5);
+        getMoonVOCForDay(prev);
+        getMoonVOCForDay(next);
+    }, 100);
     
     // Retrograde planets
     const retroPlanets = getRetrogradePlanets(date);
@@ -1199,41 +1119,6 @@ function _computeDailyData(date) {
         mercuryStatus.onclick = () => showRetroDialog('Mercury', false);
     } else {
         mercuryStatus.style.display = 'none';
-    }
-    
-    // Eclipses - separate card
-    const eclipseCard = document.getElementById('eclipse-card');
-    const eclipseTodayInfo = document.getElementById('eclipse-today-info');
-    const eclipseUpcomingList = document.getElementById('eclipse-upcoming-list');
-    const todayEclipses = getEclipsesForDay(date);
-    
-    eclipseCard.style.display = 'block';
-    
-    if (todayEclipses.length > 0) {
-        eclipseTodayInfo.innerHTML = todayEclipses.map(e => `
-            <div class="eclipse-item eclipse-active">
-                <span class="eclipse-emoji">${e.emoji}</span>
-                <div class="eclipse-info">
-                    <div class="eclipse-name">${e.kind}</div>
-                    <div class="eclipse-time">Peak at ${formatTimeInTZ(e.peakTime)}</div>
-                </div>
-            </div>
-        `).join('');
-    } else {
-        eclipseTodayInfo.innerHTML = '<div class="no-eclipse">No eclipse today</div>';
-    }
-    
-    const nextEclipses = getNextEclipses(date, 3);
-    if (nextEclipses.length > 0) {
-        eclipseUpcomingList.innerHTML = nextEclipses.map(e => `
-            <div class="eclipse-item">
-                <span class="eclipse-emoji">${e.emoji}</span>
-                <div class="eclipse-info">
-                    <div class="eclipse-name">${e.kind}</div>
-                    <div class="eclipse-time">${formatDateInTZ(e.peakTime)} at ${formatTimeInTZ(e.peakTime)}</div>
-                </div>
-            </div>
-        `).join('');
     }
 }
 
@@ -1300,6 +1185,7 @@ function showDayDialog(date) {
     document.getElementById('day-dialog').style.display = 'flex';
 }
 
+// Fix 2: Updated day dialog with moon phase timing
 function updateDayDialogContent() {
     const date = dayDialogDate;
     const phaseInfo = getPhaseInfo(date);
@@ -1313,7 +1199,7 @@ function updateDayDialogContent() {
     const itemsContainer = document.getElementById('day-dialog-items');
     itemsContainer.innerHTML = '';
     
-    // Moon Phase with timing
+    // Moon Phase with timing (Fix 2)
     const phaseTargets = [0, 90, 180, 270];
     const phaseNames = ['New Moon', 'First Quarter', 'Full Moon', 'Last Quarter'];
     let exactPhaseInfo = null;
@@ -1356,7 +1242,7 @@ function updateDayDialogContent() {
         itemsContainer.appendChild(signItem);
     });
     
-    // Moon Void of Course
+    // Moon Void of Course - Only show if there are VOC periods
     if (vocPeriods.length > 0) {
         vocPeriods.forEach(p => {
             const vocItem = createDayDialogItem(
@@ -1385,19 +1271,6 @@ function updateDayDialogContent() {
             null
         );
         itemsContainer.appendChild(retroItem);
-    }
-    
-    // Eclipses
-    const dayEclipses = getEclipsesForDay(date);
-    if (dayEclipses.length > 0) {
-        dayEclipses.forEach(e => {
-            const eclipseItem = createDayDialogItem(
-                e.emoji,
-                `${e.kind} — Peak at ${formatTimeInTZ(e.peakTime)}`,
-                null
-            );
-            itemsContainer.appendChild(eclipseItem);
-        });
     }
 }
 
@@ -1439,7 +1312,7 @@ function showRetroDialog(planet, isRetrograde) {
 }
 
 // ============================================
-// INSTANT NAVIGATION - no delays
+// SMOOTH SWIPE NAVIGATION
 // ============================================
 function initSwipeNavigation() {
     document.querySelectorAll('.swipeable-card').forEach(card => {
@@ -1447,8 +1320,38 @@ function initSwipeNavigation() {
         const nextBtn = card.querySelector('.swipe-btn.next');
         
         function navigateDay(direction) {
-            selectedDate = new Date(selectedDate.getTime() + (direction === 'next' ? 1 : -1) * 86400000);
-            updateDailyView();
+            // Lock card height during transition to prevent size change
+            const currentHeight = card.offsetHeight;
+            const currentWidth = card.offsetWidth;
+            card.style.minHeight = currentHeight + 'px';
+            card.style.maxHeight = currentHeight + 'px';
+            card.style.width = currentWidth + 'px';
+            
+            card.classList.remove('swipe-enter-left', 'swipe-enter-right', 'swiping-left', 'swiping-right');
+            void card.offsetWidth;
+            
+            if (direction === 'next') {
+                card.classList.add('swiping-left');
+            } else {
+                card.classList.add('swiping-right');
+            }
+            
+            setTimeout(() => {
+                selectedDate = new Date(selectedDate.getTime() + (direction === 'next' ? 1 : -1) * 24 * 60 * 60 * 1000);
+                updateDailyView();
+                
+                card.classList.remove('swiping-left', 'swiping-right');
+                void card.offsetWidth;
+                card.classList.add(direction === 'next' ? 'swipe-enter-left' : 'swipe-enter-right');
+                
+                setTimeout(() => {
+                    card.classList.remove('swipe-enter-left', 'swipe-enter-right');
+                    // Release height/width lock after animation
+                    card.style.minHeight = '';
+                    card.style.maxHeight = '';
+                    card.style.width = '';
+                }, 350);
+            }, 200);
         }
         
         if (prevBtn) {
@@ -1456,11 +1359,6 @@ function initSwipeNavigation() {
                 e.stopPropagation();
                 navigateDay('prev');
             });
-            prevBtn.addEventListener('touchend', (e) => {
-                e.preventDefault();
-                e.stopPropagation();
-                navigateDay('prev');
-            }, { passive: false });
         }
         
         if (nextBtn) {
@@ -1468,14 +1366,9 @@ function initSwipeNavigation() {
                 e.stopPropagation();
                 navigateDay('next');
             });
-            nextBtn.addEventListener('touchend', (e) => {
-                e.preventDefault();
-                e.stopPropagation();
-                navigateDay('next');
-            }, { passive: false });
         }
         
-        // Touch swipe
+        // Touch swipe - prevent page scroll during horizontal swipe
         let touchStartX = 0;
         let touchStartY = 0;
         let isSwiping = false;
@@ -1496,6 +1389,7 @@ function initSwipeNavigation() {
             const dx = e.changedTouches[0].clientX - touchStartX;
             const dy = e.changedTouches[0].clientY - touchStartY;
             
+            // If horizontal movement is dominant, prevent vertical scroll
             if (Math.abs(dx) > Math.abs(dy) && Math.abs(dx) > 10) {
                 isSwiping = true;
                 e.preventDefault();
@@ -1558,14 +1452,14 @@ function initDayDialogSwipe() {
 
 function navigateDayDialogPrev() {
     if (dayDialogDate) {
-        dayDialogDate = new Date(dayDialogDate.getTime() - 86400000);
+        dayDialogDate = new Date(dayDialogDate.getTime() - 24 * 60 * 60 * 1000);
         updateDayDialogContent();
     }
 }
 
 function navigateDayDialogNext() {
     if (dayDialogDate) {
-        dayDialogDate = new Date(dayDialogDate.getTime() + 86400000);
+        dayDialogDate = new Date(dayDialogDate.getTime() + 24 * 60 * 60 * 1000);
         updateDayDialogContent();
     }
 }
@@ -1574,12 +1468,12 @@ function navigateDayDialogNext() {
 // DAY NAVIGATION
 // ============================================
 function navigateToPrevDay() {
-    selectedDate = new Date(selectedDate.getTime() - 86400000);
+    selectedDate = new Date(selectedDate.getTime() - 24 * 60 * 60 * 1000);
     updateDailyView();
 }
 
 function navigateToNextDay() {
-    selectedDate = new Date(selectedDate.getTime() + 86400000);
+    selectedDate = new Date(selectedDate.getTime() + 24 * 60 * 60 * 1000);
     updateDailyView();
 }
 
@@ -1606,14 +1500,9 @@ document.addEventListener('DOMContentLoaded', () => {
         });
     });
     
-    // Prev/Next Day buttons - use both click and touchend for instant response
-    const prevDayBtn = document.getElementById('prev-day');
-    const nextDayBtn = document.getElementById('next-day');
-    
-    prevDayBtn.addEventListener('click', navigateToPrevDay);
-    nextDayBtn.addEventListener('click', navigateToNextDay);
-    prevDayBtn.addEventListener('touchend', (e) => { e.preventDefault(); navigateToPrevDay(); }, { passive: false });
-    nextDayBtn.addEventListener('touchend', (e) => { e.preventDefault(); navigateToNextDay(); }, { passive: false });
+    // Prev/Next Day buttons next to date
+    document.getElementById('prev-day').addEventListener('click', navigateToPrevDay);
+    document.getElementById('next-day').addEventListener('click', navigateToNextDay);
     
     // Return to today
     document.getElementById('return-today').addEventListener('click', () => {
@@ -1633,12 +1522,8 @@ document.addEventListener('DOMContentLoaded', () => {
     });
     
     // Day dialog navigation buttons
-    const dayDialogPrev = document.getElementById('day-dialog-prev');
-    const dayDialogNext = document.getElementById('day-dialog-next');
-    dayDialogPrev.addEventListener('click', navigateDayDialogPrev);
-    dayDialogNext.addEventListener('click', navigateDayDialogNext);
-    dayDialogPrev.addEventListener('touchend', (e) => { e.preventDefault(); navigateDayDialogPrev(); }, { passive: false });
-    dayDialogNext.addEventListener('touchend', (e) => { e.preventDefault(); navigateDayDialogNext(); }, { passive: false });
+    document.getElementById('day-dialog-prev').addEventListener('click', navigateDayDialogPrev);
+    document.getElementById('day-dialog-next').addEventListener('click', navigateDayDialogNext);
     
     // Close dialogs
     const dialogClosers = [
